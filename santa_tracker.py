@@ -1,9 +1,13 @@
 import requests
+from datetime import datetime, timedelta, timezone
+import uuid
+import xml.etree.ElementTree as ET
 
 SANTA_INFO_URL = (
     "https://santa-api.appspot.com/info"
     "?client=web&language=en&fingerprint=&routeOffset=0&streamOffset=0"
 )
+
 
 def get_santa_location():
     """Return (lat, lon, raw_json) from the Google Santa API."""
@@ -46,57 +50,102 @@ def get_route_destinations(info_json):
 
 def get_presents_delivered(info_json, mode="current"):
     """
-    Return the number of presents delivered.
+    Return number of presents delivered.
 
     mode="current" -> approximate based on now vs takeoff/duration.
     mode="final"   -> value at the final destination (landing).
     """
     destinations = get_route_destinations(info_json)
 
-    # All destinations have cumulative presentsDelivered
-    # final total is the last one
+    # cumulative, last is final total
     final_total = destinations[-1].get("presentsDelivered")
 
     if mode == "final":
         return final_total
 
-    # For "current", map time fraction -> index into destinations
     now_ms = info_json.get("now")
     takeoff_ms = info_json.get("takeoff")
     duration_ms = info_json.get("duration") or 1
 
-    # If timing info is missing, fall back to final
     if now_ms is None or takeoff_ms is None:
+        # Fall back to final if timing info is missing
         return final_total
 
     frac = (now_ms - takeoff_ms) / duration_ms
 
-    # Before takeoff: clamp to first stop
     if frac <= 0:
         idx = 0
-    # After landing: clamp to last stop
     elif frac >= 1:
         idx = len(destinations) - 1
     else:
         idx = int(frac * (len(destinations) - 1))
 
-    # Safety clamp
     idx = max(0, min(idx, len(destinations) - 1))
-
     current_total = destinations[idx].get("presentsDelivered")
     return current_total
 
 
+def build_santa_cot(lat, lon, presents_delivered, uid="SANTA-TRACKER", stale_minutes=5):
+    """
+    Build a CoT event for Santa at the given lat/lon and presents count.
+    Returns the CoT XML string.
+    """
+    now = datetime.now(timezone.utc)
+    time_str = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    stale = (now + timedelta(minutes=stale_minutes)).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+    if uid is None:
+        uid = f"SANTA-{uuid.uuid4()}"
+
+    # Neutral > Air Track > Civil Aircraft > Lighter than Air
+    event = ET.Element("event", {
+        "version": "2.0",
+        "uid": uid,
+        "type": "a-n-A-C-L",
+        "time": time_str,
+        "start": time_str,
+        "stale": stale,
+        "how": "m-g",  # machine-generated, GPS-ish
+    })
+
+    ET.SubElement(event, "point", {
+        "lat": f"{lat:.6f}",
+        "lon": f"{lon:.6f}",
+        "hae": "0",            # you can change this to put Santa at altitude
+        "ce": "9999999.0",
+        "le": "9999999.0",
+    })
+
+    detail = ET.SubElement(event, "detail")
+
+    # Group attributes per your spec
+    ET.SubElement(detail, "group", {
+        "exrole": "Santa",
+        "role": "Team Lead",
+        "name": "Red",
+        "abbr": "S",
+    })
+
+    # Optional contact/callsign
+    ET.SubElement(detail, "contact", {"callsign": "SANTA"})
+
+    # Remarks with present count
+    remarks = ET.SubElement(detail, "remarks")
+    remarks.text = f"Present Delivered: {presents_delivered}"
+
+    xml_bytes = ET.tostring(event, encoding="utf-8", xml_declaration=True)
+    return xml_bytes.decode("utf-8")
+
+
 if __name__ == "__main__":
-    lat, lon, data = get_santa_location()
+    lat, lon, info = get_santa_location()
     print("Santa location:", lat, lon)
-    print("Raw JSON:", data)
 
-    try:
-        current_presents = get_presents_delivered(data, mode="current")
-        final_presents = get_presents_delivered(data, mode="final")
+    presents_now = get_presents_delivered(info, mode="current")
+    print("Presents delivered (approx now):", presents_now)
 
-        print(f"\nApprox presents delivered *now*: {current_presents:,}")
-        print(f"Presents delivered at *landing*: {final_presents:,}")
-    except Exception as e:
-        print("\nError while fetching presentsDelivered info:", e)
+    cot_xml = build_santa_cot(lat, lon, presents_now, uid="SANTA-GOOGLE-TRACKER")
+    print("\nCoT message:\n")
+    print(cot_xml)
