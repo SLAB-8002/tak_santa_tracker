@@ -620,12 +620,12 @@ def santa_pos_from_route(
     last = len(dests) - 1
     return lat, lon, 0.0, last, last
 
-def get_santa_location_and_route():
+def get_santa_location_and_route(time_offset_s: int = 0):
     resp = requests.get(SANTA_INFO_URL, timeout=5)
     resp.raise_for_status()
     info = resp.json()
 
-    now_ms = int(info.get("now", 0))
+    now_ms = int(info.get("now", 0)) + (int(time_offset_s) * 1000)
     takeoff_ms = int(info.get("takeoff", 0)) if info.get("takeoff") else None
 
     route_url = (info.get("route") or [None])[0]
@@ -760,8 +760,8 @@ def presents_dynamic_live(destinations: list[dict], idx: int, next_idx: int, now
 # CoT builders (kept as your working versions)
 # ---------------------------------------------------------------------------
 
-def build_santa_cot(lat, lon, hae_m, presents_delivered, next_display, uid, stale_minutes=5, now_dt_utc: datetime | None = None):
-    now = now_dt_utc or datetime.now(timezone.utc)
+def build_santa_cot(lat, lon, hae_m, presents_delivered, next_display, uid, time_offset, stale_minutes=5):
+    now = datetime.now(timezone.utc) + timedelta(seconds=time_offset)
     time_str = iso_z(now)
     stale = iso_z(now + timedelta(minutes=stale_minutes))
 
@@ -799,8 +799,8 @@ def build_santa_cot(lat, lon, hae_m, presents_delivered, next_display, uid, stal
     return ET.tostring(event, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
-def build_goto_cot(dest_info, uid, stale_hours=24, now_dt_utc: datetime | None = None):
-    now = now_dt_utc or datetime.now(timezone.utc)
+def build_goto_cot(dest_info, uid, time_offset, stale_hours=24):
+    now = datetime.now(timezone.utc) + timedelta(seconds=time_offset)
     time_str = iso_z(now)
     stale = iso_z(now + timedelta(hours=stale_hours))
 
@@ -846,7 +846,7 @@ def build_goto_cot(dest_info, uid, stale_hours=24, now_dt_utc: datetime | None =
     return ET.tostring(event, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
-def build_rb_cot(origin_lat, origin_lon, origin_hae, dest_info, parent_uid, range_uid, uid, stale_minutes=1, now_dt_utc: datetime | None = None):
+def build_rb_cot(origin_lat, origin_lon, origin_hae, dest_info, parent_uid, range_uid, uid, time_offset, stale_minutes=1):
     dest_lat = dest_info["lat"]
     dest_lon = dest_info["lon"]
     dest_hae = 0.0
@@ -856,7 +856,7 @@ def build_rb_cot(origin_lat, origin_lon, origin_hae, dest_info, parent_uid, rang
         dest_lat, dest_lon, dest_hae
     )
 
-    now = now_dt_utc or datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc) + timedelta(seconds=time_offset)
     time_str = iso_z(now)
     stale = iso_z(now + timedelta(minutes=stale_minutes))
 
@@ -948,11 +948,11 @@ def build_delete_cot(tgt_uid: str, stale_seconds: int = 5) -> str:
 
 def run_once(sender: SenderBase, args):
     # Fetch API once per tick
-    lat_api, lon_api, hae_api, idx_api, next_idx, destinations, info = get_santa_location_and_route()
+    lat_api, lon_api, hae_api, idx_api, next_idx, destinations, info = get_santa_location_and_route(
+        time_offset_s=args.time_offset
+    )
 
     live = api_is_live(info)
-    api_now_ms = int(info.get("now", 0))
-    api_now_dt = datetime.fromtimestamp(api_now_ms / 1000.0, tz=timezone.utc)
 
     # --- PRE-LIVE ---
     if not live:
@@ -961,7 +961,7 @@ def run_once(sender: SenderBase, args):
         next_display = format_countdown(info)
         hae_m = 0.0
 
-        santa_cot = build_santa_cot(lat, lon, hae_m, presents_now, next_display, uid=SANTA_UUID, now_dt_utc=api_now_dt)
+        santa_cot = build_santa_cot(lat, lon, hae_m, presents_now, next_display, uid=SANTA_UUID)
         sender.send(santa_cot)
 
         if args.verbose:
@@ -982,11 +982,13 @@ def run_once(sender: SenderBase, args):
     takeoff_ms = int(info.get("takeoff", 0)) if info.get("takeoff") else None
 
     # 1) Dynamic presents ramp X->Y until next arrival + 1 minute
+    now_ms = int((datetime.now(timezone.utc) + timedelta(seconds=args.time_offset)).timestamp() * 1000)
+
     presents_now = presents_dynamic_live(
         destinations=destinations,
         idx=idx_api,
         next_idx=next_idx,
-        now_ms=api_now_ms,
+        now_ms=now_ms,
         takeoff_ms=takeoff_ms,
     )
 
@@ -1005,7 +1007,7 @@ def run_once(sender: SenderBase, args):
             di = resolve_destination(d)
             if not di:
                 continue
-            sender.send(build_goto_cot(di, uid=raw_id, now_dt_utc=api_now_dt))
+            sender.send(build_goto_cot(di, uid=raw_id, time_offset=args.time_offset))
 
         VISITED_PUSH_DONE = True
         if args.verbose:
@@ -1036,7 +1038,7 @@ def run_once(sender: SenderBase, args):
     else:
         next_display = pretty_next_name
 
-    santa_cot = build_santa_cot(lat, lon, hae_m, presents_now, next_display, uid=SANTA_UUID, now_dt_utc=api_now_dt)
+    santa_cot = build_santa_cot(lat, lon, hae_m, presents_now, next_display, uid=SANTA_UUID, time_offset=args.time_offset)
     sender.send(santa_cot)
 
     if args.verbose:
@@ -1045,7 +1047,7 @@ def run_once(sender: SenderBase, args):
     if dest_info:
         dest_uid = raw_next_id
 
-        goto_cot = build_goto_cot(dest_info, uid=dest_uid, now_dt_utc=api_now_dt)
+        goto_cot = build_goto_cot(dest_info, uid=dest_uid, time_offset=args.time_offset)
         sender.send(goto_cot)
 
         rb_cot = build_rb_cot(
@@ -1056,16 +1058,12 @@ def run_once(sender: SenderBase, args):
             parent_uid=SANTA_UUID,
             range_uid=dest_uid,
             uid=RB_UUID,
-            now_dt_utc=api_now_dt
+            time_offset=args.time_offset
         )
         sender.send(rb_cot)
 
         if args.verbose:
             print(f"[GOTO] uid={dest_uid}  {dest_info['lat']:.6f},{dest_info['lon']:.6f}")
-
-        if args.verbose:
-            local_ms = int(time.time() * 1000)
-            print(f"[CLOCK] local-api = {(local_ms - api_now_ms) / 1000.0:+.1f}s")
 
 def prompt_runtime_config() -> argparse.Namespace:
     print("No --mode specified. Configure output:\n")
@@ -1225,6 +1223,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--insecure", action="store_true", help="Disable TLS verification (testing only)")
     p.add_argument("--p12file", help="Client certificate bundle (PKCS#12 .p12/.pfx) for mTLS")
     p.add_argument("--p12pass", help="Password for --p12file (optional)")
+    p.add_argument("--time_offset", type=int, default=0, help="Time offset in seconds applied to current time (negative delays Santa)")
 
     args = p.parse_args()
     args.verbose = (not args.quiet)

@@ -90,6 +90,35 @@ This is useful for quick testing or one-off runs.
 
 **Command-line usage is preferred for repeatable setups, scripts, or services.**
 
+#### Full usage
+```bash
+usage: santa_tracker.py [-h] [--interval INTERVAL] [--once] [--quiet] [--mode {udp-mcast,tcp,tls}] [--bind BIND] [--mcast MCAST] [--iface IFACE] [--port PORT] [--host HOST] [--cafile CAFILE] [--certfile CERTFILE] [--keyfile KEYFILE]
+                        [--insecure] [--p12file P12FILE] [--p12pass P12PASS] [--time_offset TIME_OFFSET]
+
+Google Santa Tracker -> CoT broadcaster (UDP/TCP/TLS)
+
+options:
+  -h, --help            show this help message and exit
+  --interval INTERVAL   Update interval in seconds (default: 10)
+  --once                Run one iteration and exit
+  --quiet               Less console output
+  --mode {udp-mcast,tcp,tls}
+                        Output mode
+  --bind BIND           Local bind IP (optional)
+  --mcast MCAST         Multicast IP (default: 239.2.3.1)
+  --iface IFACE         Multicast interface IP (default: 0.0.0.0)
+  --port PORT           Port (default: 6969)
+  --host HOST           Host for TCP/TLS
+  --cafile CAFILE       CA file for TLS server verification
+  --certfile CERTFILE   Client certificate file for mTLS
+  --keyfile KEYFILE     Client private key file for mTLS
+  --insecure            Disable TLS verification (testing only)
+  --p12file P12FILE     Client certificate bundle (PKCS#12 .p12/.pfx) for mTLS
+  --p12pass P12PASS     Password for --p12file (optional)
+  --time_offset TIME_OFFSET 
+                        Time offset in seconds applied to current time (negative delays Santa)
+```
+
 #### UDP Multicast (typical ATAK LAN setup)
 ```bash
 python3 santa_tracker.py \
@@ -142,6 +171,9 @@ python3 santa_tracker.py \
   --interval 10
 ```
 
+## Time offset
+
+In testing I was seeing a consistent difference of about 40 seconds between Google's reported location and what the script was showing. The `time_offset` argument gives the user a way to tweak this if needed. A `time_offset` of about `-40` seems to work well for me.
 ## Verbosity
 
 Default output is verbose. To reduce console output:
