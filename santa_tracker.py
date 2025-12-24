@@ -2,28 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import csv
 import math
 import os
+import requests
 import socket
 import ssl
 import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
-
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import requests
-
-# Optional geopy import (script still works without it)
-try:
-    from geopy.geocoders import Nominatim
-except ImportError:
-    Nominatim = None
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,26 +23,22 @@ SANTA_INFO_URL = (
     "?client=web&language=en&fingerprint=&routeOffset=0&streamOffset=0"
 )
 
+VISITED_PUSH_DONE = False
+
 DEFAULT_MULTICAST_IP = "239.2.3.1"
 DEFAULT_PORT = 6969
-
-# Offline CSV (Natural Earth populated places) in same folder as script
-OFFLINE_CSV_PATH = Path(__file__).with_name("ne_50m_populated_places.csv")
-
-# In-memory caches
-OFFLINE_INDEX = None  # loaded from CSV
-LOOKUP_CACHE = {}     # per-destination cache
 
 # UUIDs for Santa and for persistent destination markers while script runs
 SANTA_UUID = "SANTA"
 DESTINATION_UUIDS = {}   # raw_id -> UUID
 RB_UUID = str(uuid.uuid4())  # single persistent Range & Bearing line UID
 
-NORTH_POLE_LAT = 90.0
-NORTH_POLE_LON = 0.0
+NORTH_POLE_LAT = 84.6
+NORTH_POLE_LON = 168
 
-# Init geopy geolocator if available
-GEOLOCATOR = Nominatim(user_agent="tak_santa_tracker") if Nominatim is not None else None
+MAX_ALT_FT = 30000.0
+FT_TO_M = 0.3048
+MAX_ALT_M = MAX_ALT_FT * FT_TO_M  # 9144.0 m
 
 # US state and Canadian province abbreviations
 STATE_PROVINCE_CODES = {
@@ -370,6 +355,9 @@ def api_is_live(info_json: dict) -> bool:
         return False
     return now_ms >= takeoff_ms
 
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
 def format_countdown(info_json: dict) -> str:
     now_ms = info_json.get("now")
     takeoff_ms = info_json.get("takeoff")
@@ -381,22 +369,10 @@ def format_countdown(info_json: dict) -> str:
     s = delta_s % 60
     return f"Takeoff in {h:02d}:{m:02d}:{s:02d}"
 
-def normalize_name_key(s: str) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-    for ch in ("'", ".", ",", "(", ")", "/", "’"):
-        s = s.replace(ch, "")
-    s = s.replace("-", " ")
-    s = "_".join(s.split())
-    return s
-
-
 def format_destination_name(raw: str) -> str:
     if not raw:
         return "Unknown"
     return " ".join(word.capitalize() for word in raw.split("_"))
-
 
 def abbrev_state_or_province(admin1: str, country_code: str) -> str:
     if not admin1:
@@ -405,12 +381,6 @@ def abbrev_state_or_province(admin1: str, country_code: str) -> str:
     if country_code in ("US", "CA") and key in STATE_PROVINCE_CODES:
         return STATE_PROVINCE_CODES[key]
     return admin1
-
-
-def get_uuid_for_destination(raw_id: str) -> str:
-    if raw_id not in DESTINATION_UUIDS:
-        DESTINATION_UUIDS[raw_id] = str(uuid.uuid4())
-    return DESTINATION_UUIDS[raw_id]
 
 def deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
@@ -452,11 +422,13 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
 def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
-@dataclass
-class SimState:
-    lat: float
-    lon: float
-    idx: int           # "current" destination index in route list (same meaning as your real idx)
+def altitude_bump_m(t: float, max_alt_m: float = MAX_ALT_M) -> float:
+    """
+    Smooth 0->peak->0 altitude profile.
+    t: progress along leg [0..1]
+    """
+    t = max(0.0, min(1.0, float(t)))
+    return max_alt_m * math.sin(math.pi * t)
 
 def dest_coords_from_obj(dest: dict):
     """Try to extract lat/lon directly from a destination object."""
@@ -522,8 +494,9 @@ def resolve_destination(dest: dict):
             "country_code": "",  # Leave blank; do not guess
         }
 
-    # fallback to your existing lookup (geopy/offline CSV)
-    return lookup_location(raw_id)
+    # No coordinates available from API object -> strict mode: do not guess
+    print(f"[DEST NO COORDS] {raw_id}")
+    return None
 
 def gc_step(lat1, lon1, lat2, lon2, step_m):
     """
@@ -558,142 +531,118 @@ def gc_step(lat1, lon1, lat2, lon2, step_m):
 
     return rad2deg(φ3), (rad2deg(λ3) + 540.0) % 360.0 - 180.0  # normalize to [-180,180]
 
-# ---------------------------------------------------------------------------
-# Offline CSV loading (Natural Earth)
-# ---------------------------------------------------------------------------
-
-def load_offline_places():
-    global OFFLINE_INDEX
-    if OFFLINE_INDEX is not None:
-        return OFFLINE_INDEX
-
-    OFFLINE_INDEX = {}
-
-    if not OFFLINE_CSV_PATH.exists():
-        return OFFLINE_INDEX
-
-    with OFFLINE_CSV_PATH.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            return OFFLINE_INDEX
-
-        field_map = {fn.lower(): fn for fn in reader.fieldnames}
-
-        def pick(*candidates):
-            for c in candidates:
-                key = c.lower()
-                if key in field_map:
-                    return field_map[key]
-            return None
-
-        name_col = pick("NAMEASCII", "NAME_EN", "NAME")
-        lat_col = pick("LATITUDE", "LAT", "Y")
-        lon_col = pick("LONGITUDE", "LON", "X")
-        admin1_col = pick("ADM1NAME", "ADMIN1_NAME", "ADMIN1")
-        iso2_col = pick("ISO_A2", "ISO2", "COUNTRY", "COUNTRY_CODE")
-
-        if not (name_col and lat_col and lon_col):
-            return OFFLINE_INDEX
-
-        for row in reader:
-            try:
-                name_raw = (row.get(name_col) or "").strip()
-                if not name_raw:
-                    continue
-                lat = float(row[lat_col])
-                lon = float(row[lon_col])
-            except Exception:
-                continue
-
-            admin1 = (row.get(admin1_col) or "").strip() if admin1_col else ""
-            iso2 = (row.get(iso2_col) or "").strip().upper() if iso2_col else ""
-            key = normalize_name_key(name_raw)
-            if not key:
-                continue
-
-            OFFLINE_INDEX[key] = {
-                "name": name_raw,
-                "lat": lat,
-                "lon": lon,
-                "admin1": admin1,
-                "country_code": iso2,
-            }
-
-    return OFFLINE_INDEX
-
-
-# ---------------------------------------------------------------------------
-# Geocoding + offline fallback
-# ---------------------------------------------------------------------------
-
-def lookup_location(raw_id: str):
-    if not raw_id:
-        return None
-
-    if raw_id in LOOKUP_CACHE:
-        return LOOKUP_CACHE[raw_id]
-
-    # 1) Online geocoding
-    if GEOLOCATOR is not None:
-        try:
-            pretty_name = format_destination_name(raw_id)
-            loc = GEOLOCATOR.geocode(pretty_name)
-            if loc:
-                rev = GEOLOCATOR.reverse(
-                    (loc.latitude, loc.longitude),
-                    language="en",
-                    exactly_one=True,
-                )
-                addr = rev.raw.get("address", {}) if rev else {}
-                country_code = (addr.get("country_code") or "").upper()
-                admin1 = addr.get("state", "")
-
-                info = {
-                    "name": pretty_name,
-                    "lat": loc.latitude,
-                    "lon": loc.longitude,
-                    "admin1": admin1,
-                    "country_code": country_code,
-                }
-                LOOKUP_CACHE[raw_id] = info
-                return info
-        except Exception:
-            pass
-
-    # 2) Offline CSV lookup
-    index = load_offline_places()
-    key = raw_id.lower()
-    if key in index:
-        info = index[key]
-        LOOKUP_CACHE[raw_id] = info
-        return info
-
-    pretty = format_destination_name(raw_id)
-    alt_key = normalize_name_key(pretty)
-    if alt_key in index:
-        info = index[alt_key]
-        LOOKUP_CACHE[raw_id] = info
-        return info
-
-    return None
-
 
 # ---------------------------------------------------------------------------
 # Santa API + route / presents
 # ---------------------------------------------------------------------------
 
-def get_santa_location():
+def santa_pos_from_route(
+    route_data: dict,
+    now_ms: int,
+    takeoff_ms: int | None = None,
+) -> tuple[float, float, float, int, int]:
+    """
+    Returns (lat, lon, hae_m, idx, next_idx)
+
+    Uses route schedule as-is:
+      - Ground: arrival..departure  -> position exactly at destination, hae=0
+      - Travel: departure..next_arrival -> interpolate, hae=bump
+    """
+    dests = route_data.get("destinations") or route_data.get("stops") or []
+    if not dests:
+        raise RuntimeError("Route has no destinations/stops")
+
+    dests = sorted(dests, key=lambda d: int(d.get("arrival", 0) or 0))
+
+    def get_latlon(d):
+        loc = d.get("location") or {}
+        return float(loc["lat"]), float(loc.get("lng", loc.get("lon")))
+
+    def get_arr_dep(d):
+        arr = int(d.get("arrival", 0) or 0)
+        dep = int(d.get("departure", arr) or arr)
+        return arr, dep
+
+    # Optional: shift a "historic year" schedule to this year's takeoff
+    shift = 0
+    if takeoff_ms:
+        first_arr, first_dep = get_arr_dep(dests[0])
+        if abs(first_dep - int(takeoff_ms)) > 7 * 24 * 3600 * 1000:
+            shift = int(takeoff_ms) - first_dep
+
+    def shifted_arr_dep(d):
+        arr, dep = get_arr_dep(d)
+        return arr + shift, dep + shift
+
+    now_ms = int(now_ms)
+
+    # Before first arrival -> at first point
+    first_arr_s, _first_dep_s = shifted_arr_dep(dests[0])
+    if now_ms < first_arr_s:
+        lat, lon = get_latlon(dests[0])
+        idx = 0
+        next_idx = 1 if len(dests) > 1 else 0
+        return lat, lon, 0.0, idx, next_idx
+
+    for i in range(len(dests)):
+        d = dests[i]
+        arr_s, dep_s = shifted_arr_dep(d)
+
+        # On ground at this destination
+        if arr_s <= now_ms <= dep_s:
+            lat, lon = get_latlon(d)
+            idx = i
+            next_idx = min(i + 1, len(dests) - 1)
+            return lat, lon, 0.0, idx, next_idx
+
+        # Traveling to next destination
+        if i < len(dests) - 1:
+            nxt = dests[i + 1]
+            nxt_arr_s, _nxt_dep_s = shifted_arr_dep(nxt)
+
+            if dep_s < now_ms < nxt_arr_s:
+                lat1, lon1 = get_latlon(d)
+                lat2, lon2 = get_latlon(nxt)
+
+                span = max(1, (nxt_arr_s - dep_s))
+                t = (now_ms - dep_s) / span  # 0..1
+
+                lat = lat1 + (lat2 - lat1) * t
+                lon = lon1 + (lon2 - lon1) * t
+                hae_m = altitude_bump_m(t, MAX_ALT_M)
+
+                idx = i
+                next_idx = i + 1
+                return float(lat), float(lon), float(hae_m), idx, next_idx
+
+    # After last departure -> at last destination
+    lat, lon = get_latlon(dests[-1])
+    last = len(dests) - 1
+    return lat, lon, 0.0, last, last
+
+def get_santa_location_and_route():
     resp = requests.get(SANTA_INFO_URL, timeout=5)
     resp.raise_for_status()
-    data = resp.json()
+    info = resp.json()
 
-    loc = data.get("location")
-    if not loc:
-        raise RuntimeError(f"No 'location' field in Santa API response: {data!r}")
+    now_ms = int(info.get("now", 0))
+    takeoff_ms = int(info.get("takeoff", 0)) if info.get("takeoff") else None
 
-    lat_str, lon_str = [s.strip() for s in loc.split(",", 1)]
-    return float(lat_str), float(lon_str), data
+    route_url = (info.get("route") or [None])[0]
+    if not route_url:
+        raise RuntimeError("No route URL in info JSON")
 
+    r = requests.get(route_url, timeout=10)
+    r.raise_for_status()
+    route_data = r.json()
+
+    destinations = route_data.get("destinations") or route_data.get("stops") or []
+    if not destinations:
+        raise RuntimeError("No destinations in route JSON")
+
+    lat, lon, hae_m, idx, next_idx = santa_pos_from_route(route_data, now_ms, takeoff_ms=takeoff_ms)
+
+    return lat, lon, hae_m, idx, next_idx, destinations, info
 
 def get_route_destinations(info_json):
     routes = info_json.get("route") or []
@@ -735,48 +684,86 @@ def get_presents_status(info_json):
     return destinations[idx].get("presentsDelivered"), idx, destinations
 
 # ---------------------------------------------------------------------------
-# Simulated location to test functionality
+# Presents interpolation helpers
 # ---------------------------------------------------------------------------
 
-def simulate_step(sim: SimState, destinations: list, dt_s: float, speed_mps: float):
-    if not destinations:
-        return sim, None
+def _sorted_dests(destinations: list[dict]) -> list[dict]:
+    return sorted(destinations or [], key=lambda d: int(d.get("arrival", 0) or 0))
 
-    # find the next resolvable destination at/after sim.idx+1
-    next_i = sim.idx + 1
-    dest_info = None
-    while next_i < len(destinations):
-        dest_info = resolve_destination(destinations[next_i])
-        if dest_info:
-            break
-        next_i += 1
+def _compute_shift_ms(dests: list[dict], takeoff_ms: int | None) -> int:
+    """
+    Mirror the 'historic year schedule' shift logic used in santa_pos_from_route().
+    Returns a shift (ms) to apply to arrival/departure times.
+    """
+    if not dests or not takeoff_ms:
+        return 0
 
-    if not dest_info:
-        return sim, None  # nowhere to go
+    first = dests[0]
+    first_dep = int(first.get("departure", first.get("arrival", 0) or 0) or 0)
 
-    tgt_lat = dest_info["lat"]
-    tgt_lon = dest_info["lon"]
+    # If the route schedule looks like it's from a different year, shift to this year's takeoff.
+    if abs(first_dep - int(takeoff_ms)) > 7 * 24 * 3600 * 1000:
+        return int(takeoff_ms) - first_dep
+    return 0
 
-    dist = haversine_m(sim.lat, sim.lon, tgt_lat, tgt_lon)
-    step = max(0.0, speed_mps * dt_s)
+def _shifted_arr_dep_ms(d: dict, shift_ms: int) -> tuple[int, int]:
+    arr = int(d.get("arrival", 0) or 0) + shift_ms
+    dep = int(d.get("departure", arr) or arr) + shift_ms
+    return arr, dep
 
-    arrive_threshold_m = 20000.0  # 20 km
-    if dist <= max(arrive_threshold_m, step):
-        sim.lat, sim.lon = tgt_lat, tgt_lon
-        sim.idx = min(next_i, len(destinations) - 1)
-        return sim, dest_info
+def presents_dynamic_live(destinations: list[dict], idx: int, next_idx: int, now_ms: int, takeoff_ms: int | None) -> int:
+    """
+    Smoothly increases presents from:
+      X = presents at current idx
+      Y = presents at next_idx
+    over time from:
+      t0 = departure(current)
+      t1 = arrival(next) + 60s
+    Clamped so:
+      - before t0 => X
+      - after t1 => Y
+    """
+    dests = _sorted_dests(destinations)
+    if not dests:
+        return 0
 
-    sim.lat, sim.lon = gc_step(sim.lat, sim.lon, tgt_lat, tgt_lon, step)
-    return sim, dest_info
+    idx = max(0, min(idx, len(dests) - 1))
+    next_idx = max(0, min(next_idx, len(dests) - 1))
+
+    # If there's no "next", just return current
+    if next_idx == idx:
+        return int(dests[idx].get("presentsDelivered", 0) or 0)
+
+    shift_ms = _compute_shift_ms(dests, takeoff_ms)
+
+    cur = dests[idx]
+    nxt = dests[next_idx]
+
+    x = int(cur.get("presentsDelivered", 0) or 0)
+    y = int(nxt.get("presentsDelivered", x) or x)
+
+    _cur_arr, cur_dep = _shifted_arr_dep_ms(cur, shift_ms)
+    nxt_arr, _nxt_dep = _shifted_arr_dep_ms(nxt, shift_ms)
+
+    t0 = cur_dep
+    t1 = nxt_arr + 60_000  # + 1 minute on the ground at next stop
+
+    if t1 <= t0:
+        return y
+
+    t = (now_ms - t0) / (t1 - t0)
+    t = max(0.0, min(1.0, float(t)))
+
+    return int(round(lerp(x, y, t)))
 
 # ---------------------------------------------------------------------------
 # CoT builders (kept as your working versions)
 # ---------------------------------------------------------------------------
 
-def build_santa_cot(lat, lon, presents_delivered, next_display, uid, stale_minutes=5):
-    now = datetime.now(timezone.utc)
-    time_str = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    stale = (now + timedelta(minutes=stale_minutes)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def build_santa_cot(lat, lon, hae_m, presents_delivered, next_display, uid, stale_minutes=5, now_dt_utc: datetime | None = None):
+    now = now_dt_utc or datetime.now(timezone.utc)
+    time_str = iso_z(now)
+    stale = iso_z(now + timedelta(minutes=stale_minutes))
 
     event = ET.Element("event", {
         "version": "2.0",
@@ -791,7 +778,7 @@ def build_santa_cot(lat, lon, presents_delivered, next_display, uid, stale_minut
     ET.SubElement(event, "point", {
         "lat": f"{lat:.6f}",
         "lon": f"{lon:.6f}",
-        "hae": "5000",
+        "hae": f"{hae_m:.1f}",
         "ce": "9999999.0",
         "le": "9999999.0",
     })
@@ -807,15 +794,15 @@ def build_santa_cot(lat, lon, presents_delivered, next_display, uid, stale_minut
     ET.SubElement(detail, "contact", {"callsign": "SANTA"})
 
     remarks = ET.SubElement(detail, "remarks")
-    remarks.text = f"Present Delivered: {presents_delivered:,}\nNext: {next_display}"
+    remarks.text = f"Presents Delivered: {presents_delivered:,}\nNext: {next_display}"
 
     return ET.tostring(event, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
-def build_goto_cot(dest_info, uid, stale_hours=24):
-    now = datetime.now(timezone.utc)
-    time_str = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    stale = (now + timedelta(hours=stale_hours)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def build_goto_cot(dest_info, uid, stale_hours=24, now_dt_utc: datetime | None = None):
+    now = now_dt_utc or datetime.now(timezone.utc)
+    time_str = iso_z(now)
+    stale = iso_z(now + timedelta(hours=stale_hours))
 
     name = dest_info["name"]
     admin1 = dest_info.get("admin1") or ""
@@ -859,7 +846,7 @@ def build_goto_cot(dest_info, uid, stale_hours=24):
     return ET.tostring(event, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
-def build_rb_cot(origin_lat, origin_lon, origin_hae, dest_info, parent_uid, range_uid, uid, stale_minutes=1):
+def build_rb_cot(origin_lat, origin_lon, origin_hae, dest_info, parent_uid, range_uid, uid, stale_minutes=1, now_dt_utc: datetime | None = None):
     dest_lat = dest_info["lat"]
     dest_lon = dest_info["lon"]
     dest_hae = 0.0
@@ -869,9 +856,9 @@ def build_rb_cot(origin_lat, origin_lon, origin_hae, dest_info, parent_uid, rang
         dest_lat, dest_lon, dest_hae
     )
 
-    now = datetime.now(timezone.utc)
-    time_str = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    stale = (now + timedelta(minutes=stale_minutes)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    now = now_dt_utc or datetime.now(timezone.utc)
+    time_str = iso_z(now)
+    stale = iso_z(now + timedelta(minutes=stale_minutes))
 
     event = ET.Element("event", {
         "version": "2.0",
@@ -959,65 +946,74 @@ def build_delete_cot(tgt_uid: str, stale_seconds: int = 5) -> str:
 # Core loop
 # ---------------------------------------------------------------------------
 
-def run_once(sender: SenderBase, args, sim_state: SimState | None):
+def run_once(sender: SenderBase, args):
     # Fetch API once per tick
-    lat_api, lon_api, info = get_santa_location()
+    lat_api, lon_api, hae_api, idx_api, next_idx, destinations, info = get_santa_location_and_route()
 
     live = api_is_live(info)
+    api_now_ms = int(info.get("now", 0))
+    api_now_dt = datetime.fromtimestamp(api_now_ms / 1000.0, tz=timezone.utc)
 
-    # --- SIM MODE (unchanged idea: still uses route for "next") ---
-    if getattr(args, "simulate", False):
-        # Always fetch route/presents from API even in simulate mode
-        presents_now, idx, destinations = get_presents_status(info)
+    # --- PRE-LIVE ---
+    if not live:
+        lat, lon = NORTH_POLE_LAT, NORTH_POLE_LON
+        presents_now = 0
+        next_display = format_countdown(info)
+        hae_m = 0.0
 
-        if sim_state is None:
-            start_idx = max(0, min(args.sim_skip, len(destinations) - 1))
+        santa_cot = build_santa_cot(lat, lon, hae_m, presents_now, next_display, uid=SANTA_UUID, now_dt_utc=api_now_dt)
+        sender.send(santa_cot)
 
-            start_lat = args.sim_start_lat
-            start_lon = args.sim_start_lon
+        if args.verbose:
+            print(f"[Santa] PRE-LIVE {lat:.6f},{lon:.6f}  next={next_display}")
 
-            if start_idx > 0:
-                start_info = resolve_destination(destinations[start_idx])
-                if start_info:
-                    start_lat = start_info["lat"]
-                    start_lon = start_info["lon"]
+        # clear lingering RB
+        try:
+            sender.send(build_delete_cot(RB_UUID))
+        except Exception:
+            pass
 
-            sim_state = SimState(lat=start_lat, lon=start_lon, idx=start_idx)
-
-        sim_state, _ = simulate_step(sim_state, destinations, dt_s=args.interval, speed_mps=args.sim_speed)
-
-        lat, lon = sim_state.lat, sim_state.lon
-        idx = sim_state.idx  # drive next-stop progression from sim
+        return
 
     # --- LIVE MODE ---
-    else:
-        # If API isn't live yet: pin Santa at North Pole and don't draw goto/R&B
-        if not live:
-            lat, lon = NORTH_POLE_LAT, NORTH_POLE_LON
-            presents_now = 0
-            next_display = format_countdown(info)
+    lat, lon, hae_m = lat_api, lon_api, hae_api
+    idx = idx_api
 
-            santa_cot = build_santa_cot(lat, lon, presents_now, next_display, uid=SANTA_UUID)
-            sender.send(santa_cot)
+    takeoff_ms = int(info.get("takeoff", 0)) if info.get("takeoff") else None
 
-            if args.verbose:
-                print(f"[Santa] PRE-LIVE {lat:.6f},{lon:.6f}  next={next_display}")
+    # 1) Dynamic presents ramp X->Y until next arrival + 1 minute
+    presents_now = presents_dynamic_live(
+        destinations=destinations,
+        idx=idx_api,
+        next_idx=next_idx,
+        now_ms=api_now_ms,
+        takeoff_ms=takeoff_ms,
+    )
 
-            # Optional: clear any lingering RB line while waiting
-            try:
-                sender.send(build_delete_cot(RB_UUID))
-            except Exception:
-                pass
+    # 2) One-time push of visited locations
+    global VISITED_PUSH_DONE
+    if not VISITED_PUSH_DONE:
+        # If Santa is on the ground at idx, include idx as "visited".
+        include_current = (hae_m <= 1.0)  # meters; route uses 0.0 on ground
+        visited_upto = idx + (1 if include_current else 0)
 
-            return sim_state
+        dests_sorted = _sorted_dests(destinations)
 
-        # If live: use API location and route/presents normally
-        lat, lon = lat_api, lon_api
-        presents_now, idx, destinations = get_presents_status(info)
+        for i in range(0, visited_upto):
+            d = dests_sorted[i]
+            raw_id = d.get("id") or f"visited_{i}"
+            di = resolve_destination(d)
+            if not di:
+                continue
+            sender.send(build_goto_cot(di, uid=raw_id, now_dt_utc=api_now_dt))
 
-    # --- pick the "next" destination object (only meaningful if destinations exists) ---
+        VISITED_PUSH_DONE = True
+        if args.verbose:
+            print(f"[BOOT] Pushed {max(0, visited_upto)} visited locations (include_current={include_current})")
+
+    # --- next destination display + markers (your existing logic) ---
     if destinations and idx < len(destinations) - 1:
-        next_dest_obj = destinations[idx + 1]
+        next_dest_obj = destinations[next_idx]
     else:
         next_dest_obj = {"id": "landing"}
 
@@ -1040,7 +1036,7 @@ def run_once(sender: SenderBase, args, sim_state: SimState | None):
     else:
         next_display = pretty_next_name
 
-    santa_cot = build_santa_cot(lat, lon, presents_now, next_display, uid=SANTA_UUID)
+    santa_cot = build_santa_cot(lat, lon, hae_m, presents_now, next_display, uid=SANTA_UUID, now_dt_utc=api_now_dt)
     sender.send(santa_cot)
 
     if args.verbose:
@@ -1049,24 +1045,27 @@ def run_once(sender: SenderBase, args, sim_state: SimState | None):
     if dest_info:
         dest_uid = raw_next_id
 
-        goto_cot = build_goto_cot(dest_info, uid=dest_uid)
+        goto_cot = build_goto_cot(dest_info, uid=dest_uid, now_dt_utc=api_now_dt)
         sender.send(goto_cot)
 
         rb_cot = build_rb_cot(
             origin_lat=lat,
             origin_lon=lon,
-            origin_hae=0.0,
+            origin_hae=hae_m,
             dest_info=dest_info,
             parent_uid=SANTA_UUID,
             range_uid=dest_uid,
             uid=RB_UUID,
+            now_dt_utc=api_now_dt
         )
         sender.send(rb_cot)
 
         if args.verbose:
             print(f"[GOTO] uid={dest_uid}  {dest_info['lat']:.6f},{dest_info['lon']:.6f}")
 
-    return sim_state
+        if args.verbose:
+            local_ms = int(time.time() * 1000)
+            print(f"[CLOCK] local-api = {(local_ms - api_now_ms) / 1000.0:+.1f}s")
 
 def prompt_runtime_config() -> argparse.Namespace:
     print("No --mode specified. Configure output:\n")
@@ -1098,12 +1097,6 @@ def prompt_runtime_config() -> argparse.Namespace:
     # NEW: p12 defaults
     ns.p12file = None
     ns.p12pass = None
-
-    # Simulation defaults (must exist because run_once expects them)
-    ns.simulate = False
-    ns.sim_speed = 250.0
-    ns.sim_start_lat = 90.0
-    ns.sim_start_lon = 0.0
 
     if choice == "1":
         ns.mode = "udp-mcast"
@@ -1233,12 +1226,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--p12file", help="Client certificate bundle (PKCS#12 .p12/.pfx) for mTLS")
     p.add_argument("--p12pass", help="Password for --p12file (optional)")
 
-    p.add_argument("--simulate", action="store_true", help="Simulate Santa movement from North Pole instead of using API location")
-    p.add_argument("--sim-speed", type=float, default=250.0, help="Simulation speed in meters/sec (default 250 m/s)")
-    p.add_argument("--sim-start-lat", type=float, default=90.0, help="Simulation start latitude (default North Pole 90.0)")
-    p.add_argument("--sim-start-lon", type=float, default=0.0, help="Simulation start longitude (default 0.0)")
-    p.add_argument("--sim-skip", type=int, default=0, help="In --simulate mode, skip ahead this many destinations at startup (default 0)")
-
     args = p.parse_args()
     args.verbose = (not args.quiet)
     # --- TLS client auth validation ---
@@ -1263,18 +1250,17 @@ def main():
     if args.verbose:
         print(f"Running every {args.interval:.1f}s via mode={args.mode}. Ctrl+C to stop.")
 
-    sim_state = None
     with sender:
         try:
             # run once or loop
             if args.once:
-                sim_state = run_once(sender, args=args, sim_state=sim_state)
+                run_once(sender, args=args)
                 return
 
             while True:
-                sim_state = run_once(sender, args=args, sim_state=sim_state)
+                run_once(sender, args=args)
                 time.sleep(args.interval)
-
+                
         except KeyboardInterrupt:
             # Delete the RB object on exit
             try:
