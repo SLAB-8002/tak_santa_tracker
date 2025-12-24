@@ -4,8 +4,10 @@
 import argparse
 import csv
 import math
+import os
 import socket
 import ssl
+import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -46,6 +48,9 @@ LOOKUP_CACHE = {}     # per-destination cache
 SANTA_UUID = "SANTA"
 DESTINATION_UUIDS = {}   # raw_id -> UUID
 RB_UUID = str(uuid.uuid4())  # single persistent Range & Bearing line UID
+
+NORTH_POLE_LAT = 90.0
+NORTH_POLE_LON = 0.0
 
 # Init geopy geolocator if available
 GEOLOCATOR = Nominatim(user_agent="tak_santa_tracker") if Nominatim is not None else None
@@ -194,9 +199,10 @@ class TcpSender(SenderBase):
 class TlsSender(SenderBase):
     """
     TLS sender (CoT over TLS).
-    - cafile: CA bundle for server verification (recommended)
-    - certfile/keyfile: client cert for mutual TLS (often required by TAK servers)
-    - insecure: disable cert verification (not recommended, but useful for testing)
+    - cafile: CA bundle for server verification (optional)
+    - certfile/keyfile: client cert (PEM) for mutual TLS
+    - p12file/p12pass: client cert (PKCS#12 .p12/.pfx) for mutual TLS
+    - insecure: disable server cert verification
     """
     def __init__(
         self,
@@ -209,6 +215,9 @@ class TlsSender(SenderBase):
         insecure: bool,
         timeout: float = 5.0,
         newline: bool = True,
+        # NEW:
+        p12file: str | None = None,
+        p12pass: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -216,29 +225,88 @@ class TlsSender(SenderBase):
         self.cafile = cafile
         self.certfile = certfile
         self.keyfile = keyfile
+        self.p12file = p12file
+        self.p12pass = p12pass
         self.insecure = insecure
         self.timeout = timeout
         self.newline = newline
         self.sock: ssl.SSLSocket | None = None
         self.ctx: ssl.SSLContext | None = None
 
+        # NEW: hold temp files for p12 conversion + delete on close
+        self._p12_temp_files: list[str] = []
+
     def open(self):
         self._build_context()
         self._connect()
 
     def _build_context(self):
-        if self.insecure:
+        # Server verification behavior:
+        # - insecure=True => CERT_NONE
+        # - insecure=False + cafile provided => CERT_REQUIRED using cafile
+        # - insecure=False + cafile None => CERT_NONE (CA not required)
+        if self.insecure or not self.cafile:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         else:
             ctx = ssl.create_default_context(cafile=self.cafile)
+            ctx.check_hostname = False  # TAK commonly uses IPs / non-matching names
 
-        # Client cert for mTLS
-        if self.certfile:
+        # Client cert for mTLS (PKCS#12 takes precedence if provided)
+        if self.p12file:
+            cert_path, key_path = self._materialize_p12_to_pem(self.p12file, self.p12pass)
+            ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        elif self.certfile:
+            # Preserve your existing behavior; keyfile may be None if certfile contains both
             ctx.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
 
         self.ctx = ctx
+
+    def _materialize_p12_to_pem(self, p12file: str, p12pass: str | None) -> tuple[str, str]:
+        """
+        Convert .p12/.pfx into temp PEM files (cert + key) for ssl.load_cert_chain().
+        Returns (cert_pem_path, key_pem_path).
+        """
+        try:
+            from cryptography.hazmat.primitives.serialization import (
+                Encoding,
+                PrivateFormat,
+                NoEncryption,
+            )
+            from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+        except ImportError as e:
+            raise RuntimeError(
+                "PKCS#12 client cert requires the 'cryptography' package. Install with: pip install cryptography"
+            ) from e
+
+        p12_bytes = Path(p12file).read_bytes()
+        password_bytes = p12pass.encode("utf-8") if p12pass else None
+
+        key, cert, _extras = load_key_and_certificates(p12_bytes, password_bytes)
+        if key is None or cert is None:
+            raise ValueError(f"PKCS#12 file did not contain both private key and certificate: {p12file}")
+
+        key_pem = key.private_bytes(
+            encoding=Encoding.PEM,
+            format=PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=NoEncryption(),
+        )
+        cert_pem = cert.public_bytes(Encoding.PEM)
+
+        # Write temp files (delete=False avoids Windows file-lock issues)
+        key_tf = tempfile.NamedTemporaryFile("wb", delete=False, suffix=".key.pem")
+        cert_tf = tempfile.NamedTemporaryFile("wb", delete=False, suffix=".crt.pem")
+        try:
+            key_tf.write(key_pem); key_tf.flush()
+            cert_tf.write(cert_pem); cert_tf.flush()
+        finally:
+            key_tf.close()
+            cert_tf.close()
+
+        # Track paths for cleanup
+        self._p12_temp_files.extend([key_tf.name, cert_tf.name])
+        return cert_tf.name, key_tf.name
 
     def _connect(self):
         self.close()
@@ -249,7 +317,10 @@ class TlsSender(SenderBase):
         raw.connect((self.host, self.port))
 
         assert self.ctx is not None
-        self.sock = self.ctx.wrap_socket(raw, server_hostname=self.host if not self.insecure else None)
+        self.sock = self.ctx.wrap_socket(
+            raw,
+            server_hostname=self.host if (not self.insecure and self.cafile) else None
+        )
 
     def close(self):
         if self.sock:
@@ -257,6 +328,15 @@ class TlsSender(SenderBase):
                 self.sock.close()
             finally:
                 self.sock = None
+
+        # NEW: cleanup any temp files created for p12
+        if self._p12_temp_files:
+            for p in self._p12_temp_files:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            self._p12_temp_files.clear()
 
     def send(self, xml_text: str):
         if not self.sock:
@@ -272,10 +352,34 @@ class TlsSender(SenderBase):
             self._connect()
             self.sock.sendall(payload)
 
-
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
+def api_is_live(info_json: dict) -> bool:
+    """
+    Google Santa API isn't truly live until now >= takeoff (and duration exists).
+    When it's not live, show Santa at North Pole.
+    """
+    now_ms = info_json.get("now")
+    takeoff_ms = info_json.get("takeoff")
+    duration_ms = info_json.get("duration")
+
+    if now_ms is None or takeoff_ms is None or duration_ms is None:
+        return False
+    if duration_ms <= 0:
+        return False
+    return now_ms >= takeoff_ms
+
+def format_countdown(info_json: dict) -> str:
+    now_ms = info_json.get("now")
+    takeoff_ms = info_json.get("takeoff")
+    if now_ms is None or takeoff_ms is None:
+        return "Waiting for takeoff…"
+    delta_s = max(0, int((takeoff_ms - now_ms) / 1000))
+    h = delta_s // 3600
+    m = (delta_s % 3600) // 60
+    s = delta_s % 60
+    return f"Takeoff in {h:02d}:{m:02d}:{s:02d}"
 
 def normalize_name_key(s: str) -> str:
     if not s:
@@ -359,8 +463,18 @@ def dest_coords_from_obj(dest: dict):
     if not dest:
         return None
 
-    # Common: "location": "lat, lon"
     loc = dest.get("location")
+
+    # NEW: location is an object: {"lat": ..., "lng": ...}
+    if isinstance(loc, dict):
+        for lat_k, lon_k in (("lat", "lng"), ("lat", "lon"), ("latitude", "longitude")):
+            if lat_k in loc and lon_k in loc:
+                try:
+                    return float(loc[lat_k]), float(loc[lon_k])
+                except Exception:
+                    pass
+
+    # Existing: location is a string: "lat, lon"
     if isinstance(loc, str) and "," in loc:
         try:
             lat_str, lon_str = [s.strip() for s in loc.split(",", 1)]
@@ -368,7 +482,7 @@ def dest_coords_from_obj(dest: dict):
         except Exception:
             pass
 
-    # Common numeric fields
+    # Existing: numeric fields at top-level
     for lat_k, lon_k in (
         ("lat", "lon"),
         ("latitude", "longitude"),
@@ -390,19 +504,22 @@ def resolve_destination(dest: dict):
     {name, lat, lon, admin1, country_code}
     """
     raw_id = dest.get("id") or "landing"
-
-    print(f"[DEST RAW_ID] {raw_id}")  # <-- ADD THIS
+    print(f"[DEST RAW_ID] {raw_id}")
 
     coords = dest_coords_from_obj(dest)
     if coords:
         lat, lon = coords
-        # Use your label formatting for display purposes
+
+        # Prefer API-provided labels
+        name = dest.get("city") or format_destination_name(raw_id)
+        admin1 = dest.get("region") or ""
+
         return {
-            "name": format_destination_name(raw_id),
+            "name": name,
             "lat": lat,
             "lon": lon,
-            "admin1": "",
-            "country_code": "",
+            "admin1": admin1,
+            "country_code": "",  # Leave blank; do not guess
         }
 
     # fallback to your existing lookup (geopy/offline CSV)
@@ -674,7 +791,7 @@ def build_santa_cot(lat, lon, presents_delivered, next_display, uid, stale_minut
     ET.SubElement(event, "point", {
         "lat": f"{lat:.6f}",
         "lon": f"{lon:.6f}",
-        "hae": "0",
+        "hae": "5000",
         "ce": "9999999.0",
         "le": "9999999.0",
     })
@@ -843,30 +960,63 @@ def build_delete_cot(tgt_uid: str, stale_seconds: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 def run_once(sender: SenderBase, args, sim_state: SimState | None):
-    # Always fetch route/presents from API (even in simulate mode)
-    # so "next destination" logic is real.
-    _, _, info = get_santa_location()
-    presents_now, idx, destinations = get_presents_status(info)
+    # Fetch API once per tick
+    lat_api, lon_api, info = get_santa_location()
 
+    live = api_is_live(info)
+
+    # --- SIM MODE (unchanged idea: still uses route for "next") ---
     if getattr(args, "simulate", False):
-        # Initialize sim_state on first run
-        if sim_state is None:
-            sim_state = SimState(lat=args.sim_start_lat, lon=args.sim_start_lon, idx=0)
+        # Always fetch route/presents from API even in simulate mode
+        presents_now, idx, destinations = get_presents_status(info)
 
-        # Drive simulation using your configured interval as dt
+        if sim_state is None:
+            start_idx = max(0, min(args.sim_skip, len(destinations) - 1))
+
+            start_lat = args.sim_start_lat
+            start_lon = args.sim_start_lon
+
+            if start_idx > 0:
+                start_info = resolve_destination(destinations[start_idx])
+                if start_info:
+                    start_lat = start_info["lat"]
+                    start_lon = start_info["lon"]
+
+            sim_state = SimState(lat=start_lat, lon=start_lon, idx=start_idx)
+
         sim_state, _ = simulate_step(sim_state, destinations, dt_s=args.interval, speed_mps=args.sim_speed)
 
         lat, lon = sim_state.lat, sim_state.lon
+        idx = sim_state.idx  # drive next-stop progression from sim
 
-        # IMPORTANT: Use sim_state.idx for next destination progression,
-        # not the API-derived idx (which will be historical/out of season).
-        idx = sim_state.idx
+    # --- LIVE MODE ---
     else:
-        # Normal mode uses API location for lat/lon
-        lat, lon, _info2 = get_santa_location()
+        # If API isn't live yet: pin Santa at North Pole and don't draw goto/R&B
+        if not live:
+            lat, lon = NORTH_POLE_LAT, NORTH_POLE_LON
+            presents_now = 0
+            next_display = format_countdown(info)
 
-    # --- pick the "next" destination object ---
-    if idx < len(destinations) - 1:
+            santa_cot = build_santa_cot(lat, lon, presents_now, next_display, uid=SANTA_UUID)
+            sender.send(santa_cot)
+
+            if args.verbose:
+                print(f"[Santa] PRE-LIVE {lat:.6f},{lon:.6f}  next={next_display}")
+
+            # Optional: clear any lingering RB line while waiting
+            try:
+                sender.send(build_delete_cot(RB_UUID))
+            except Exception:
+                pass
+
+            return sim_state
+
+        # If live: use API location and route/presents normally
+        lat, lon = lat_api, lon_api
+        presents_now, idx, destinations = get_presents_status(info)
+
+    # --- pick the "next" destination object (only meaningful if destinations exists) ---
+    if destinations and idx < len(destinations) - 1:
         next_dest_obj = destinations[idx + 1]
     else:
         next_dest_obj = {"id": "landing"}
@@ -874,7 +1024,6 @@ def run_once(sender: SenderBase, args, sim_state: SimState | None):
     raw_next_id = next_dest_obj.get("id") or "landing"
     pretty_next_name = format_destination_name(raw_next_id)
 
-    # IMPORTANT: this is the update you added; actually use it here
     dest_info = resolve_destination(next_dest_obj)
 
     if dest_info:
@@ -913,6 +1062,7 @@ def run_once(sender: SenderBase, args, sim_state: SimState | None):
             uid=RB_UUID,
         )
         sender.send(rb_cot)
+
         if args.verbose:
             print(f"[GOTO] uid={dest_uid}  {dest_info['lat']:.6f},{dest_info['lon']:.6f}")
 
@@ -944,6 +1094,11 @@ def prompt_runtime_config() -> argparse.Namespace:
     ns.certfile = None
     ns.keyfile = None
     ns.insecure = False
+
+    # NEW: p12 defaults
+    ns.p12file = None
+    ns.p12pass = None
+
     # Simulation defaults (must exist because run_once expects them)
     ns.simulate = False
     ns.sim_speed = 250.0
@@ -976,20 +1131,45 @@ def prompt_runtime_config() -> argparse.Namespace:
     elif choice == "3":
         ns.mode = "tls"
         ns.host = input("Host: ").strip()
-        ns.port = int(input("TLS Port: ").strip())
+        ns.port = int(input(f"TLS Port [{DEFAULT_PORT}]: ").strip() or str(DEFAULT_PORT))
+
         ns.cafile = input("CA file path (optional): ").strip() or None
-        ns.certfile = input("Client cert path (optional): ").strip() or None
-        ns.keyfile = input("Client key path (optional): ").strip() or None
+
+        print("\nClient authentication (mTLS) (optional):")
+        print("1) None")
+        print("2) PEM cert + key")
+        print("3) PKCS#12 (.p12/.pfx)")
+        client_choice = input("Select (1/2/3) [1]: ").strip() or "1"
+
+        if client_choice == "2":
+            ns.certfile = input("Client cert path (PEM): ").strip() or None
+            ns.keyfile = input("Client key path (PEM): ").strip() or None
+        elif client_choice == "3":
+            ns.p12file = input("Client P12/PFX path: ").strip() or None
+            # password optional; allow empty for no password
+            ns.p12pass = input("P12 password (optional): ").strip() or None
+        elif client_choice != "1":
+            raise SystemExit("Invalid client auth selection")
+
         insecure = input("Disable TLS verification? (y/N): ").strip().lower()
         ns.insecure = (insecure == "y")
+
         b = input("Bind IP (optional): ").strip()
         if b:
             ns.bind = b
+
     else:
         raise SystemExit("Invalid selection")
 
-    return ns
+    # --- Keep runtime prompt behavior consistent with CLI validation ---
+    if getattr(ns, "keyfile", None) and not getattr(ns, "certfile", None):
+        raise SystemExit("--keyfile requires --certfile")
+    if getattr(ns, "p12pass", None) and not getattr(ns, "p12file", None):
+        raise SystemExit("--p12pass requires --p12file")
+    if getattr(ns, "certfile", None) and getattr(ns, "p12file", None):
+        raise SystemExit("Use either PEM (--certfile/--keyfile) OR PKCS#12 (--p12file), not both")
 
+    return ns
 
 def build_sender_from_args(args: argparse.Namespace) -> SenderBase:
     if args.mode == "udp-mcast":
@@ -1023,6 +1203,9 @@ def build_sender_from_args(args: argparse.Namespace) -> SenderBase:
             insecure=args.insecure,
             timeout=5.0,
             newline=True,
+            # NEW:
+            p12file=args.p12file,
+            p12pass=args.p12pass,
         )
     raise SystemExit(f"Unknown mode: {args.mode}")
 
@@ -1047,14 +1230,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--certfile", help="Client certificate file for mTLS")
     p.add_argument("--keyfile", help="Client private key file for mTLS")
     p.add_argument("--insecure", action="store_true", help="Disable TLS verification (testing only)")
+    p.add_argument("--p12file", help="Client certificate bundle (PKCS#12 .p12/.pfx) for mTLS")
+    p.add_argument("--p12pass", help="Password for --p12file (optional)")
 
     p.add_argument("--simulate", action="store_true", help="Simulate Santa movement from North Pole instead of using API location")
     p.add_argument("--sim-speed", type=float, default=250.0, help="Simulation speed in meters/sec (default 250 m/s)")
     p.add_argument("--sim-start-lat", type=float, default=90.0, help="Simulation start latitude (default North Pole 90.0)")
     p.add_argument("--sim-start-lon", type=float, default=0.0, help="Simulation start longitude (default 0.0)")
+    p.add_argument("--sim-skip", type=int, default=0, help="In --simulate mode, skip ahead this many destinations at startup (default 0)")
 
     args = p.parse_args()
     args.verbose = (not args.quiet)
+    # --- TLS client auth validation ---
+    if args.keyfile and not args.certfile:
+        raise SystemExit("--keyfile requires --certfile")
+
+    if args.p12pass and not args.p12file:
+        raise SystemExit("--p12pass requires --p12file")
+
+    if args.certfile and args.p12file:
+        raise SystemExit("Use either --certfile/--keyfile OR --p12file, not both")
+
     return args
 
 def main():
